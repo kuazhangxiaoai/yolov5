@@ -7,7 +7,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from utils.general import colorstr, emojis
 from utils.loggers.wandb.wandb_utils import WandbLogger
-from utils.plots import plot_images, plot_results
+from utils.plots import plot_images, plot_results, plot_skyline_images
 from utils.torch_utils import de_parallel
 
 LOGGERS = ('csv', 'tb', 'wandb')  # text-file, TensorBoard, Weights & Biases
@@ -29,9 +29,12 @@ class Loggers():
         self.hyp = hyp
         self.logger = logger  # for printing results to console
         self.include = include
-        self.keys = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
-                     'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',  # metrics
-                     'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
+        #self.keys = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
+        #             'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',  # metrics
+        #             'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
+        #             'x/lr0', 'x/lr1', 'x/lr2']  # params
+        self.keys = ['train/obj_loss', 'train/reg_loss',  # train loss
+                     'val/min_error', 'val/max_error', 'val/mean_error', 'val/std_error', # val loss
                      'x/lr0', 'x/lr1', 'x/lr2']  # params
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary
@@ -74,7 +77,9 @@ class Loggers():
                     self.tb.add_graph(torch.jit.trace(de_parallel(model), imgs[0:1], strict=False), [])
             if ni < 3:
                 f = self.save_dir / f'train_batch{ni}.jpg'  # filename
-                Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
+                #plot_skyline_images(imgs, targets, paths, f)
+                Thread(target=plot_skyline_images, args=(imgs, targets, paths, f), daemon=True).start()
+                #Thread(target=plot_skyline_images, args=(imgs, targets, paths, f), daemon=True).start()
             if self.wandb and ni == 10:
                 files = sorted(self.save_dir.glob('train*.jpg'))
                 self.wandb.log({'Mosaics': [wandb.Image(str(f), caption=f.name) for f in files if f.exists()]})

@@ -430,6 +430,20 @@ def xywhn2xyxy(x, w=640, h=640, padw=0, padh=0):
     y[:, 3] = h * (x[:, 1] + x[:, 3] / 2) + padh  # bottom right y
     return y
 
+def labelNormlize(x, scalew, scaleh, padw=0, padh=0, gridsize=128, stride=8):
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[:, 0] = (y[:, 0] * scalew) + round(padw)
+    y[:, 1] = (y[:, 1] * scaleh) + round(padh)
+    n = y.shape[0]
+    if n != gridsize:
+        gx, gy = np.zeros((gridsize), dtype=y.dtype),np.zeros((gridsize), dtype=y.dtype)
+        nx, ny = np.copy(y[:, 0]), np.copy(y[:, 1])
+        gx[np.floor(np.divide(nx, stride)).astype(np.int)] = nx
+        gy[np.floor(np.divide(nx, stride)).astype(np.int)] = ny
+        return np.stack([gx, gy], axis=1)
+    else:
+        return y
+
 
 def xyxy2xywhn(x, w=640, h=640, clip=False, eps=0.0):
     # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] normalized where xy1=top-left, xy2=bottom-right
@@ -719,3 +733,88 @@ def increment_path(path, exist_ok=False, sep='', mkdir=False):
     if not dir.exists() and mkdir:
         dir.mkdir(parents=True, exist_ok=True)  # make directory
     return path
+
+def targets_visualize(images, tobj, treg,targets, stride, paths):
+    if isinstance(images, torch.Tensor):
+        imgs = images.clone().cpu().numpy()
+    if isinstance(tobj, torch.Tensor):
+        tobj_v = tobj.clone().cpu().numpy()
+    if isinstance(treg, torch.Tensor):
+        treg_v = treg.clone().cpu().numpy()
+    if isinstance(targets, torch.Tensor):
+        targets_v = targets.clone().cpu().numpy()
+
+    if np.max(imgs[0]) <= 1:
+        imgs *= 255
+
+    bs,_, h, w = images.shape
+    for i in range(bs):
+        saved_path = os.path.join("/home/yanggang/PyCharmWorkspace/trash", paths[i].split('/')[-1])
+        img, obj,reg, tar = imgs[i], tobj_v[i], treg_v[i], targets_v[i]
+        dimg = img.transpose(1, 2, 0).copy()
+        my, mx = np.where(obj == 1.0)
+        regm = reg * obj
+        xs, ys = np.arange(start=0, stop=w), np.arange(start=0, stop=h)
+
+        for (x, y) in zip(mx, my):
+            offset = regm[y, x]
+            offset = stride * math.exp(offset/2)
+            x *= stride
+            y *= stride
+            cv2.circle(dimg, center=(int(x+stride/2), int(y+offset)), radius=2, color=(255, 0, 0), thickness=2)
+
+        cv2.imwrite(saved_path, cv2.cvtColor(dimg, cv2.COLOR_RGB2BGR))
+
+def skyline_decode(img, pred, r=None, pad=None, thresh=0.8, stride=8, draw=False, savedpath=None):
+    if draw:
+        assert (savedpath is not None)
+    if r is not None:
+        assert pad is not None
+
+    pred_obj, pred_y = pred[..., 0].cpu().numpy(), (pred[..., 1].tanh() * 2).cpu().numpy()
+
+    h, w = pred_obj.shape
+    yi, xi, py = [], [], []
+    #yi, xi, py = torch.zeros(h).to(device),torch.zeros(w).to(device),torch.zeros(h).to(device)
+    for i in range(w):
+        strip = pred_obj[:, i]
+        y = np.argmax(strip)
+        v = np.max(strip)
+        if v > thresh:
+            xi.append(i)
+            yi.append(y)
+            py.append(pred_y[y, i])
+    yi, xi, py = np.array(yi), np.array(xi), np.array(py)
+
+    #yi, xi = torch.where(pred_obj > thresh)
+    yi, xi, py = yi * stride, xi * stride + stride // 2, py * stride
+    #py = pred_y[pred_obj > thresh] * stride
+    if (r is not None) and (pad is not None):
+        dw, dh = pad
+        rw, rh = r
+        yi = (yi / rh) - dh
+        xi = (xi / rw) - dw
+
+    if draw:
+        draw_xi, draw_yi, draw_py = np.copy(xi), np.copy(yi), np.copy(py)
+        n = draw_xi.shape[0]
+        for i in range(n):
+            x, y = draw_xi[i], draw_yi[i] - draw_py[i]
+            cv2.circle(img, center=(int(x), int(y)), radius=2, color=(255, 0, 0),thickness=2)
+        cv2.imwrite(savedpath, img)
+
+
+    return torch.cat([torch.from_numpy(xi).unsqueeze(1), torch.from_numpy(yi - py).unsqueeze(1)], dim=1)
+
+def computeDistance(m0, m1, type='abs'):
+    assert type == 'abs' or type == 'eur'
+    x0, y0 = m0[..., 0], m0[..., 1]
+    x1, y1 = m1[..., 0], m1[..., 1]
+    if type == 'abs':
+        dist = (x1 - x0).abs() + (y1 - y0).abs()
+    if type == 'eur':
+        dist = torch.sqrt((x1 - x0).square() + (y1 - y0).square())
+    return dist
+
+
+

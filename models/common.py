@@ -31,9 +31,9 @@ def autopad(k, p=None):  # kernel, padding
 
 class Conv(nn.Module):
     # Standard convolution
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, bias=False):  # ch_in, ch_out, kernel, stride, padding, groups
         super().__init__()
-        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=bias)
         self.bn = nn.BatchNorm2d(c2)
         self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
@@ -389,3 +389,100 @@ class Classify(nn.Module):
     def forward(self, x):
         z = torch.cat([self.aap(y) for y in (x if isinstance(x, list) else [x])], 1)  # cat if list
         return self.flat(self.conv(z))  # flatten to x(b,c2)
+
+class SPPF(nn.Module):
+    # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
+    def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
+        super().__init__()
+        c_ = c1 // 2  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
+            y1 = self.m(x)
+            y2 = self.m(y1)
+            return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
+
+class BISMDetect(nn.Module):
+    def __init__(self, ch, outplane):
+        super(BISMDetect, self).__init__()
+        self.upsample0 = nn.Upsample(scale_factor=2)
+        self.upsample1 = nn.Upsample(scale_factor=2)
+        self.Conv0 = Conv(ch[0], 128, k=3, s=1,p=1, bias=True)
+        self.Conv1 = Conv(ch[1], 128, k=3, s=1, p=1, bias=True)
+        self.Conv2 = Conv(ch[2], 128, k=3, s=1, p=1, bias=True)
+        self.Conv3 = Conv(256, 256, k=3, s=1, p=1, bias=True)
+        self.Conv4 = Conv(256, 512, k=3, s=1, p=1, bias=True)
+        self.Conv5 = nn.Conv2d(640, outplane, kernel_size=1)
+        self.concat0 = Concat()
+        self.concat1 = Concat()
+
+    def forward(self, x):
+        x0, x1, x2 = self.Conv0(x[0]), self.Conv1(x[1]), self.Conv2(x[2])
+        x12 = self.Conv3(self.concat1([x1, self.upsample1(x2)]))
+        y = self.Conv5(self.concat0([x0, self.upsample0(self.Conv4(x12))]))
+        bs, c, gy, gx = y.shape
+        y = y.view(bs, c, gy, gx).permute(0, 2, 3, 1).contiguous()
+        return y
+
+    def _init_weight(self):
+        bias_conv0 = self.Conv0.conv.bias
+        b = bias_conv0.view(1, -1)
+        b.data[:, 0] += math.log(8 / (640 / 8) ** 2)
+        b.data[:, 1] += math.log(0.6 / (1 - 0.99))
+        self.Conv0.bn.eps = 1e-3
+        self.Conv0.bn.momentum = 0.03
+        self.Conv0.act.inplace = True
+        self.Conv0.conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+
+        bias_conv1 = self.Conv1.conv.bias
+        b = bias_conv1.view(1, -1)
+        b.data[:, 0] += math.log(8 / (640 / 8) ** 2)
+        b.data[:, 1] += math.log(0.6 / (1 - 0.99))
+        self.Conv1.bn.eps = 1e-3
+        self.Conv1.bn.momentum = 0.03
+        self.Conv1.act.inplace = True
+        self.Conv1.conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+
+        bias_conv2 = self.Conv2.conv.bias
+        b = bias_conv2.view(1, -1)
+        b.data[:, 0] += math.log(8 / (640 / 8) ** 2)
+        b.data[:, 1] += math.log(0.6 / (1 - 0.99))
+        self.Conv2.bn.eps = 1e-3
+        self.Conv2.bn.momentum = 0.03
+        self.Conv2.act.inplace = True
+        self.Conv2.conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+
+        bias_conv3 = self.Conv3.conv.bias
+        b = bias_conv3.view(1, -1)
+        b.data[:, 0] += math.log(8 / (640 / 8) ** 2)
+        b.data[:, 1] += math.log(0.6 / (1 - 0.99))
+        self.Conv3.bn.eps = 1e-3
+        self.Conv3.bn.momentum = 0.03
+        self.Conv3.act.inplace = True
+        self.Conv3.conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+
+        bias_conv4 = self.Conv4.conv.bias
+        b = bias_conv4.view(1, -1)
+        b.data[:, 0] += math.log(8 / (640 / 8) ** 2)
+        b.data[:, 1] += math.log(0.6 / (1 - 0.99))
+        self.Conv4.bn.eps = 1e-3
+        self.Conv4.bn.momentum = 0.03
+        self.Conv4.act.inplace = True
+        self.Conv4.conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+
+        bias_conv5 = self.Conv5.bias
+        b = bias_conv5.view(1, -1)
+        b.data[:, 0] += math.log(8 / (640 / 8) ** 2)
+        b.data[:, 1] += math.log(0.6 / (1 - 0.99))
+        self.Conv5.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+
+
+
+
+
+

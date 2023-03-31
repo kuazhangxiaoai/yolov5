@@ -21,7 +21,8 @@ sys.path.append(FILE.parents[0].as_posix())  # add yolov5/ to path
 from models.experimental import attempt_load
 from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
-    box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
+    box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr,\
+    skyline_decode, computeDistance
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_sync
@@ -289,13 +290,134 @@ def run(data,
         maps[c] = ap[i]
     return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
 
+@torch.no_grad()
+def evaluate(data,
+            weights=None,  # model.pt path(s)
+            batch_size=32,  # batch size
+            imgsz=640,  # inference size (pixels)
+            conf_thres=0.001,  # confidence threshold
+            iou_thres=0.6,  # NMS IoU threshold
+            task='val',  # train, val, test, speed or study
+            device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
+            single_cls=False,  # treat as single-class dataset
+            augment=False,  # augmented inference
+            verbose=False,  # verbose output
+            save_txt=False,  # save results to *.txt
+            save_hybrid=False,  # save label+prediction hybrid results to *.txt
+            save_conf=False,  # save confidences in --save-txt labels
+            save_json=False,  # save a COCO-JSON results file
+            project='runs/val',  # save to project/name
+            name='exp',  # save to project/name
+            exist_ok=False,  # existing project/name ok, do not increment
+            half=True,  # use FP16 half-precision inference
+            model=None,
+            dataloader=None,
+            save_dir=Path(''),
+            plots=True,
+            callbacks=Callbacks(),
+            compute_loss=None,
+            ):
+    # Initialize/load model and set device
+    training = model is not None
+
+    if training:  # called by train.py
+        device = next(model.parameters()).device  # get model device
+
+    else:  # called directly
+        device = select_device(device, batch_size=batch_size)
+
+        # Directories
+        save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
+        (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+
+        # Load model
+        model = attempt_load(weights, map_location=device)  # load FP32 model
+        gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+        imgsz = check_img_size(imgsz, s=gs)  # check image size
+        stride = int(model.stride.max())
+        # Multi-GPU disabled, incompatible with .half() https://github.com/ultralytics/yolov5/issues/99
+        # if device.type != 'cpu' and torch.cuda.device_count() > 1:
+        #     model = nn.DataParallel(model)
+
+        # Data
+        data = check_dataset(data)  # check
+        # Half
+    half &= device.type != 'cpu'  # half precision only supported on CUDA
+    if half:
+        model.half()
+
+    # Configure
+    model.eval()
+
+    # Dataloader
+    if not training:
+        if device.type != 'cpu':
+            model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
+        task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
+        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, single_cls, pad=0.5, rect=False,
+                                       prefix=colorstr(f'{task}: '))[0]
+
+    s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'min', 'max', 'average', 'std')
+    minError = 1e5 * torch.ones(1).to(device)
+    maxError, averageError, stdError = torch.zeros(1).to(device), torch.zeros(1).to(device), torch.zeros(1).to(device)
+
+    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+        bs = img.shape[0]
+        t_ = time_sync()
+        img = img.to(device, non_blocking=True)
+        img = img.half() if half else img.float()  # uint8 to fp16/32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        targets = targets.to(device)
+        nb, _, height, width = img.shape  # batch size, channels, height, width
+        t = time_sync()
+
+        preds = model(img, augment=False)
+
+        for i, p in enumerate(preds):
+            n = batch_i * bs + i
+            pred = skyline_decode(img[i], p, r=None, pad=None, thresh=0.8).to(device)
+            target = targets[i]
+            #target[:, 0] = target[:, 0] - stride // 2
+            if pred.shape[0] <= 0:
+                continue
+            if torch.equal(target[0], torch.zeros(2, dtype=target.dtype, device=device)):
+                startpoint_x = target[1, 0]
+                pred[:, 0] = pred[:, 0] - 4.0 + startpoint_x
+            else:
+                startpoint_x = target[0, 0]
+                pred[:, 0] = pred[:, 0] - 4.0 + startpoint_x
+
+
+            num_pred,num_target = pred.shape[0], target.shape[0]
+            predmap = pred.unsqueeze(0).repeat(num_target, 1, 1)
+            targetmap = target.unsqueeze(1).repeat(1, num_pred, 1)
+            dist = computeDistance(predmap, targetmap)
+            errors = torch.min(dist, dim=0)[0]
+            minError_t = dist.min()
+            maxError_t = errors.max()
+            averageError_t = errors.mean()
+            stdError_t = errors.std()
+            stdError = torch.sqrt(stdError.square() + stdError_t.square())
+            averageError = (n / (n + 1)) * averageError + (1 / (n + 1)) * averageError_t
+
+            minError = minError_t if minError_t < minError else minError
+            maxError = maxError_t if maxError_t > maxError else maxError
+
+    return minError, maxError, averageError, stdError
+
+
+
+
+
+
+
 
 def parse_opt():
     parser = argparse.ArgumentParser(prog='val.py')
-    parser.add_argument('--data', type=str, default='data/coco128.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default='data/bism-skyline.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
-    parser.add_argument('--batch-size', type=int, default=32, help='batch size')
-    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--batch-size', type=int, default=1, help='batch size')
+    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=1024, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
@@ -324,7 +446,7 @@ def main(opt):
     check_requirements(requirements=FILE.parent / 'requirements.txt', exclude=('tensorboard', 'thop'))
 
     if opt.task in ('train', 'val', 'test'):  # run normally
-        run(**vars(opt))
+        evaluate(**vars(opt))
 
     elif opt.task == 'speed':  # speed benchmarks
         for w in opt.weights if isinstance(opt.weights, list) else [opt.weights]:

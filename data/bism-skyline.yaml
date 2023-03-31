@@ -1,0 +1,6 @@
+path: /home/yanggang/data/bismskyline_split_yolo
+train: train/images
+val: val/images
+
+nc: 1
+names: ['skyline']

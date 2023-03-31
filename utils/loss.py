@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from utils.metrics import bbox_iou
 from utils.torch_utils import is_parallel
+from utils.general import targets_visualize
 
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
@@ -218,3 +219,86 @@ class ComputeLoss:
             tcls.append(c)  # class
 
         return tcls, tbox, indices, anch
+
+class ComputeSkylineLoss:
+    def __init__(self, model, autobalance=False, half=True):
+        super(ComputeSkylineLoss, self).__init__()
+        self.sort_obj_iou = False
+        device = next(model.parameters()).device  # get model device
+        h = model.hyp  # hyperparameters
+        self.half = half
+        # Define criteria
+        BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['obj_pw']], device=device))
+        MSEreg = nn.MSELoss()
+        # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
+        self.cp, self.cn = smooth_BCE(eps=h.get('label_smoothing', 0.0))  # positive, negative BCE targets
+        det = model.module.model[-2] if is_parallel(model) else model.model[-2]  # Detect() module
+        self.BCEobj, self.MSEreg, self.gr, self.hyp, self.autobalance =  BCEobj,MSEreg, 1.0, h, autobalance
+        self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
+        self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
+        self.stride = 8
+        for k in 'nc', 'nl':
+            setattr(self, k, getattr(det, k))
+
+    def __call__(self, p, targets):  # predictions, targets, model
+        self.device = targets.device
+
+        #targets_visualize(image, tobjs, tregs,targets, stride=self.stride, paths=paths)
+        if self.half:
+            tregs, tobjs = self.build_targets(p, targets.half())
+            tregs, tobjs = tregs.half(), tobjs.half()
+            lobj, lreg = torch.zeros(1, device=self.device).half(), torch.zeros(1, device=self.device).half()
+        else:
+            tregs, tobjs = self.build_targets(p, targets)
+            lobj, lreg = torch.zeros(1, device=self.device), torch.zeros(1, device=self.device)
+        bs = p.shape[0]
+        pobj, preg = p[...,0], p[...,1]
+        lobj += self.BCEobj(pobj, tobjs)
+        lreg += self.MSEreg(preg.tanh() * 2, tregs)
+
+        lobj *= self.hyp['obj']
+        lreg *= self.hyp['reg']
+        return (lobj + lreg) * bs, torch.cat((lobj, lreg)).detach()
+
+
+
+    def build_targets(self, p, targets):
+        tregs, tobjs = [], []
+        bs, gs, ch = p.shape[0], p.shape[1], p.shape[-1]
+
+        for i in range(bs):
+            target = (targets[targets[:, 0]==i])[:, 1:]
+            pi = p[i]
+            if target.shape[0] <= 0:
+                tobj, treg = pi[..., 0], pi[..., 1]
+                tregs.append(treg.unsqueeze(0))
+                tobjs.append(tobj.unsqueeze(0))
+                target_regs, target_objs = torch.cat(tregs), torch.cat(tobjs)
+            else:
+                grid = torch.arange(start=0, end=gs, dtype=torch.float16, device=self.device).repeat(gs, 1).T
+                filter = torch.ones(gs, dtype=torch.float16, device=self.device) * 1e3
+                tobj, treg = torch.zeros_like(pi[...,0]), torch.zeros_like(pi[...,1])
+                xi = torch.divide(target[:, 0].clone(), self.stride).floor()
+                py = torch.divide(target[:, 1].clone(), self.stride)
+                filter[xi.long()] = py
+                py = filter.repeat(gs, 1)
+                yi = torch.divide(target[:, 1].clone(), self.stride).floor()
+                tobj[yi.long(), xi.long()] = 1.0
+
+                treg = grid - py #directly sub
+                #treg = reg_y
+                treg = torch.where(treg < 2, treg,  pi[...,1])
+                treg = torch.where(treg > (-1.0* 2), treg, pi[...,1])
+
+                tregs.append(treg.unsqueeze(0))
+                tobjs.append(tobj.unsqueeze(0))
+                target_regs, target_objs = torch.cat(tregs), torch.cat(tobjs)
+            #tmask = target_regs > 0
+
+
+        return target_regs, target_objs
+
+
+
+
+

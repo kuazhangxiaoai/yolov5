@@ -4,6 +4,7 @@ from copy import copy
 from pathlib import Path
 
 import cv2
+import os
 import math
 import matplotlib
 import matplotlib.pyplot as plt
@@ -198,6 +199,31 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
         # cv2.imwrite(fname, cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB))  # cv2 save
         Image.fromarray(mosaic).save(fname)  # PIL save
     return mosaic
+
+def plot_skyline_images(images, targets, paths=None, fname='image.jpg', names=None, max_size=1024, max_subplots=16):
+    if isinstance(images, torch.Tensor):
+        images = images.cpu().float().numpy()
+    if isinstance(targets, torch.Tensor):
+        targets = targets.cpu().numpy()
+    # un-normalise
+    if np.max(images[0]) <= 1:
+        images *= 255
+    tl = 3  # line thickness
+    bs, _, h, w = images.shape  # batch size, _, height, width
+
+    for i, img in enumerate(images):
+        saved_path = os.path.join(fname.parent, paths[i].split('/')[-1])
+        if i == max_subplots:  # if last batch has fewer images than we expect
+            break
+
+        img = img.transpose(1, 2, 0)
+        dimg = img.astype(np.uint8).copy()
+        target = (targets[targets[:, 0]==i])[:, 1:].copy()
+        if len(target):
+            for p in target:
+                px, py = int(p[0]), int(p[1])
+                cv2.circle(dimg, center=(px, py), radius=3, color=(255, 0, 0), thickness=3)
+        cv2.imwrite(saved_path, cv2.cvtColor(dimg, cv2.COLOR_RGB2BGR))
 
 
 def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
